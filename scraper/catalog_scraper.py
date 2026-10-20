@@ -423,13 +423,30 @@ def dump_jsonl(path: Path, records: Iterable[VideoCard]) -> int:
     return count
 
 
+def select_categories(
+    categories: list[Category],
+    *,
+    max_tags: int = 1,
+    tag_offset: int = 0,
+    all_tags: bool = False,
+) -> list[Category]:
+    """Select a deterministic zero-based slice of categories for batch runs."""
+    if tag_offset < 0:
+        raise ValueError("tag_offset must be >= 0")
+    if max_tags < 1:
+        raise ValueError("max_tags must be >= 1")
+    remaining = categories[tag_offset:]
+    return remaining if all_tags else remaining[:max_tags]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Extract listing-card metadata only; video and preview files are not downloaded."
     )
     parser.add_argument("--tags-file", type=Path, default=DEFAULT_TAG_FILE)
     parser.add_argument("--max-tags", type=int, default=1, help="Limit the run to this many tags (safe default: 1).")
-    parser.add_argument("--all-tags", action="store_true", help="Process the entire tag list after a test run.")
+    parser.add_argument("--tag-offset", type=int, default=0, help="Zero-based category index to start at, for batch runs.")
+    parser.add_argument("--all-tags", action="store_true", help="Process every tag from --tag-offset onward.")
     parser.add_argument("--max-pages", type=int, default=40, help="Maximum pages per tag (default: 40).")
     parser.add_argument("--delay", type=float, default=1.5, help="Seconds between page requests (default: 1.5).")
     parser.add_argument("--output-jsonl", type=Path, help="Optional JSONL export path.")
@@ -440,19 +457,29 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
-    if args.max_pages < 1 or args.delay < 0 or args.max_tags < 1:
-        parser.error("--max-pages and --max-tags must be >= 1; --delay must be >= 0")
+    if args.max_pages < 1 or args.delay < 0 or args.max_tags < 1 or args.tag_offset < 0:
+        parser.error("--max-pages and --max-tags must be >= 1; --tag-offset and --delay must be >= 0")
     if args.write_db and not os.environ.get("DATABASE_URL"):
         parser.error("--write-db requires DATABASE_URL in the environment")
 
     categories = load_categories(args.tags_file)
     if not categories:
         parser.error(f"No categories found in {args.tags_file}")
-    selected = categories if args.all_tags else categories[:args.max_tags]
+    selected = select_categories(
+        categories, max_tags=args.max_tags, tag_offset=args.tag_offset, all_tags=args.all_tags
+    )
+    if not selected:
+        parser.error(f"No categories available at zero-based --tag-offset {args.tag_offset}")
     if not args.all_tags:
-        LOG.info("Limited mode: %d tag(s), up to %d page(s) each.", len(selected), args.max_pages)
+        LOG.info(
+            "Limited mode: %d tag(s) starting at index %d, up to %d page(s) each.",
+            len(selected), args.tag_offset, args.max_pages,
+        )
     else:
-        LOG.warning("Full catalog mode: %d tags × up to %d pages each.", len(selected), args.max_pages)
+        LOG.warning(
+            "Full catalog mode: %d tags from index %d × up to %d pages each.",
+            len(selected), args.tag_offset, args.max_pages,
+        )
 
     session = build_session(args.user_agent)
     sink: DatabaseSink | None = None
@@ -467,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "max_pages": args.max_pages, "delay_seconds": args.delay,
                     "all_tags": args.all_tags, "max_tags": args.max_tags,
-                    "tags_file": str(args.tags_file),
+                    "tag_offset": args.tag_offset, "tags_file": str(args.tags_file),
                 },
                 len(selected),
             )
