@@ -111,3 +111,11 @@ def test_crawler_respects_max_page_limit():
     assert len(records) == 1
     assert len(calls) == 1
     assert stats["end_reason"] == "max_pages_reached"
+
+
+def test_loads_query_style_category_paths_without_losing_filter():
+    tags_file = Path(__file__).resolve().parent / "fixtures" / "query_tags.json"
+    tags = load_categories(tags_file)
+    assert len(tags) == 1
+    assert tags[0].slug == "18yearsold"
+    assert tags[0].path == "/?k=18yearsold&p="
