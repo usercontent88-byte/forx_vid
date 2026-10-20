@@ -91,6 +91,10 @@ jobs:
           print(f"Requested zero-based range: {offset} through {offset + max_tags - 1}.")
           PY
 
+      - name: Apply catalog schema (only when Neon writes are enabled)
+        if: env.WRITE_DB == 'true'
+        run: python -m scraper.apply_schema
+
       - name: Scrape selected category batch
         shell: bash
         run: |
