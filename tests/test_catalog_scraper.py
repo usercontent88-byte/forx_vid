@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from scraper.catalog_scraper import (
     Category,
     crawl_category,
+    crawl_categories_parallel,
     load_categories,
     parse_duration,
     parse_listing_html,
@@ -146,3 +147,42 @@ def test_schema_migration_is_idempotent_and_includes_required_tables():
     assert "create table if not exists catalog_scrape_pages" in sql
     assert "drop table" not in sql
     assert "truncate table" not in sql
+
+
+
+def test_parallel_workers_log_page_counts_without_retaining_cards(caplog):
+    from types import SimpleNamespace
+    import logging
+
+    fixture_html = FIXTURE.read_text(encoding="utf-8")
+    empty_html = "<html><body><div>No videos found</div></body></html>"
+    categories = [
+        Category(slug="tag-a", label="Tag A", path="/tags/tag-a"),
+        Category(slug="tag-b", label="Tag B", path="/tags/tag-b"),
+    ]
+
+    def fake_fetcher(_session, url):
+        return empty_html if url.endswith("/2") else fixture_html
+
+    with caplog.at_level(logging.INFO):
+        results = list(crawl_categories_parallel(
+            categories,
+            workers=2,
+            max_pages=5,
+            delay_seconds=0,
+            base_url="https://www.xvideos.com",
+            user_agent="test-agent",
+            collect_records=False,
+            fetcher=fake_fetcher,
+            session_factory=lambda _ua: SimpleNamespace(close=lambda: None),
+        ))
+
+    assert {category.slug for category, _, _ in results} == {"tag-a", "tag-b"}
+    for category, records, stats in results:
+        assert records == []
+        assert stats["pages_visited"] == 2
+        assert stats["cards_seen"] == 1
+        assert stats["end_reason"] == "no_cards"
+    assert "[tag-a] page 1: 1 cards extracted" in caplog.text
+    assert "[tag-b] page 1: 1 cards extracted" in caplog.text
+    assert "[tag-a] page 2: 0 cards extracted" in caplog.text
