@@ -7,9 +7,11 @@ import os
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -238,44 +240,50 @@ def fetch_html(session: requests.Session, url: str, timeout: float = 25) -> str:
 
 
 class DatabaseSink:
-    """PostgreSQL sink; psycopg is imported only when database output is requested."""
+    """Thread-safe PostgreSQL sink; page transactions are serialized by a lock."""
 
     def __init__(self, database_url: str):
         try:
             import psycopg  # type: ignore
         except ImportError as exc:
-            raise RuntimeError("Install dependencies with: pip install -r requirements.txt") from exc
+            raise RuntimeError("Install dependencies with: python -m pip install -r requirements.txt") from exc
         self.conn = psycopg.connect(database_url)
         self.conn.autocommit = False
+        # Network fetches run in parallel, but the single shared DB connection is
+        # protected so each page's insert/link/upsert transaction stays atomic.
+        self._lock = threading.RLock()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def start_run(self, config: dict[str, Any], expected_tags: int) -> int:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO catalog_scrape_runs (status, expected_tags, config)
-                   VALUES ('running', %s, %s::jsonb) RETURNING id""",
-                (expected_tags, json.dumps(config)),
-            )
-            run_id = cur.fetchone()[0]
-        self.conn.commit()
-        return run_id
+        with self._lock:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO catalog_scrape_runs (status, expected_tags, config)
+                       VALUES ('running', %s, %s::jsonb) RETURNING id""",
+                    (expected_tags, json.dumps(config)),
+                )
+                run_id = cur.fetchone()[0]
+            self.conn.commit()
+            return run_id
 
     def upsert_category(self, category: Category) -> int:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO catalog_tags (source, slug, label, tag_path)
-                   VALUES ('xvideos', %s, %s, %s)
-                   ON CONFLICT (source, slug) DO UPDATE SET
-                     label = EXCLUDED.label, tag_path = EXCLUDED.tag_path,
-                     updated_at = now()
-                   RETURNING id""",
-                (category.slug, category.label, category.path),
-            )
-            tag_id = cur.fetchone()[0]
-        self.conn.commit()
-        return tag_id
+        with self._lock:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO catalog_tags (source, slug, label, tag_path)
+                       VALUES ('xvideos', %s, %s, %s)
+                       ON CONFLICT (source, slug) DO UPDATE SET
+                         label = EXCLUDED.label, tag_path = EXCLUDED.tag_path,
+                         updated_at = now()
+                       RETURNING id""",
+                    (category.slug, category.label, category.path),
+                )
+                tag_id = cur.fetchone()[0]
+            self.conn.commit()
+            return tag_id
 
     def write_page(
         self,
@@ -288,65 +296,67 @@ class DatabaseSink:
         error_text: str | None = None,
     ) -> None:
         request_path = path_only(request_url, keep_query=True) or "/"
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO catalog_scrape_pages
-                     (run_id, tag_id, page_number, request_path, status, card_count, error_text)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (run_id, tag_id, page_number) DO UPDATE SET
-                     request_path = EXCLUDED.request_path, status = EXCLUDED.status,
-                     card_count = EXCLUDED.card_count, error_text = EXCLUDED.error_text,
-                     fetched_at = now()""",
-                (run_id, tag_id, page_number, request_path, status, len(cards), error_text),
-            )
-            for card in cards:
+        with self._lock:
+            with self.conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO catalog_videos
-                         (source, external_id, external_eid, page_path, title,
-                          duration_text, duration_seconds, thumbnail_path, mosaic_path,
-                          preview_path, raw_source_data)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                       ON CONFLICT (source, page_path) DO UPDATE SET
-                         external_id = COALESCE(EXCLUDED.external_id, catalog_videos.external_id),
-                         external_eid = COALESCE(EXCLUDED.external_eid, catalog_videos.external_eid),
-                         title = EXCLUDED.title,
-                         duration_text = COALESCE(EXCLUDED.duration_text, catalog_videos.duration_text),
-                         duration_seconds = COALESCE(EXCLUDED.duration_seconds, catalog_videos.duration_seconds),
-                         thumbnail_path = COALESCE(EXCLUDED.thumbnail_path, catalog_videos.thumbnail_path),
-                         mosaic_path = COALESCE(EXCLUDED.mosaic_path, catalog_videos.mosaic_path),
-                         preview_path = COALESCE(EXCLUDED.preview_path, catalog_videos.preview_path),
-                         raw_source_data = catalog_videos.raw_source_data || EXCLUDED.raw_source_data,
-                         last_seen_at = now(), updated_at = now()
-                       RETURNING id""",
-                    (
-                        card.source, card.external_id, card.external_eid, card.page_path,
-                        card.title, card.duration_text, card.duration_seconds,
-                        card.thumbnail_path, card.mosaic_path, card.preview_path,
-                        json.dumps(card.raw_source_data),
-                    ),
+                    """INSERT INTO catalog_scrape_pages
+                         (run_id, tag_id, page_number, request_path, status, card_count, error_text)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (run_id, tag_id, page_number) DO UPDATE SET
+                         request_path = EXCLUDED.request_path, status = EXCLUDED.status,
+                         card_count = EXCLUDED.card_count, error_text = EXCLUDED.error_text,
+                         fetched_at = now()""",
+                    (run_id, tag_id, page_number, request_path, status, len(cards), error_text),
                 )
-                video_id = cur.fetchone()[0]
-                cur.execute(
-                    """INSERT INTO catalog_video_tags (video_id, tag_id)
-                       VALUES (%s, %s) ON CONFLICT DO NOTHING""",
-                    (video_id, tag_id),
-                )
-        self.conn.commit()
+                for card in cards:
+                    cur.execute(
+                        """INSERT INTO catalog_videos
+                             (source, external_id, external_eid, page_path, title,
+                              duration_text, duration_seconds, thumbnail_path, mosaic_path,
+                              preview_path, raw_source_data)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                           ON CONFLICT (source, page_path) DO UPDATE SET
+                             external_id = COALESCE(EXCLUDED.external_id, catalog_videos.external_id),
+                             external_eid = COALESCE(EXCLUDED.external_eid, catalog_videos.external_eid),
+                             title = EXCLUDED.title,
+                             duration_text = COALESCE(EXCLUDED.duration_text, catalog_videos.duration_text),
+                             duration_seconds = COALESCE(EXCLUDED.duration_seconds, catalog_videos.duration_seconds),
+                             thumbnail_path = COALESCE(EXCLUDED.thumbnail_path, catalog_videos.thumbnail_path),
+                             mosaic_path = COALESCE(EXCLUDED.mosaic_path, catalog_videos.mosaic_path),
+                             preview_path = COALESCE(EXCLUDED.preview_path, catalog_videos.preview_path),
+                             raw_source_data = catalog_videos.raw_source_data || EXCLUDED.raw_source_data,
+                             last_seen_at = now(), updated_at = now()
+                           RETURNING id""",
+                        (
+                            card.source, card.external_id, card.external_eid, card.page_path,
+                            card.title, card.duration_text, card.duration_seconds,
+                            card.thumbnail_path, card.mosaic_path, card.preview_path,
+                            json.dumps(card.raw_source_data),
+                        ),
+                    )
+                    video_id = cur.fetchone()[0]
+                    cur.execute(
+                        """INSERT INTO catalog_video_tags (video_id, tag_id)
+                           VALUES (%s, %s) ON CONFLICT DO NOTHING""",
+                        (video_id, tag_id),
+                    )
+            self.conn.commit()
 
     def finish_run(self, run_id: int, status: str, summary: dict[str, Any]) -> None:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """UPDATE catalog_scrape_runs SET status = %s, finished_at = now(),
-                     tags_processed = %s, pages_visited = %s, cards_seen = %s,
-                     errors = %s::jsonb, summary = %s::jsonb
-                   WHERE id = %s""",
-                (
-                    status, summary.get("tags_processed", 0), summary.get("pages_visited", 0),
-                    summary.get("cards_seen", 0), json.dumps(summary.get("errors", [])),
-                    json.dumps(summary), run_id,
-                ),
-            )
-        self.conn.commit()
+        with self._lock:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE catalog_scrape_runs SET status = %s, finished_at = now(),
+                         tags_processed = %s, pages_visited = %s, cards_seen = %s,
+                         errors = %s::jsonb, summary = %s::jsonb
+                       WHERE id = %s""",
+                    (
+                        status, summary.get("tags_processed", 0), summary.get("pages_visited", 0),
+                        summary.get("cards_seen", 0), json.dumps(summary.get("errors", [])),
+                        json.dumps(summary), run_id,
+                    ),
+                )
+            self.conn.commit()
 
 
 def crawl_category(
@@ -360,6 +370,7 @@ def crawl_category(
     sink: DatabaseSink | None = None,
     run_id: int | None = None,
     tag_id: int | None = None,
+    collect_records: bool = True,
 ) -> tuple[list[VideoCard], dict[str, Any]]:
     if max_pages < 1:
         raise ValueError("max_pages must be at least 1")
@@ -368,6 +379,7 @@ def crawl_category(
     output: list[VideoCard] = []
     end_reason = "max_pages_reached"
     page_count = 0
+    cards_seen = 0
     errors: list[str] = []
 
     for page_number in range(1, max_pages + 1):
@@ -379,8 +391,6 @@ def crawl_category(
         try:
             html = fetcher(session, current_url)
             cards, next_url = parse_listing_html(html, category, base_url)
-            if sink and run_id is not None and tag_id is not None:
-                sink.write_page(run_id, tag_id, page_number, current_url, cards)
         except Exception as exc:
             message = f"page {page_number} ({path_only(current_url, keep_query=True)}): {type(exc).__name__}: {exc}"
             errors.append(message)
@@ -390,10 +400,25 @@ def crawl_category(
             end_reason = "request_or_parse_error"
             break
 
+        # Database exceptions intentionally propagate as fatal errors. A DB outage
+        # must not be disguised as an empty or failed website page.
+        if sink and run_id is not None and tag_id is not None:
+            sink.write_page(
+                run_id, tag_id, page_number, current_url, cards,
+                status="ok" if cards else "empty",
+            )
+        LOG.info(
+            "[%s] page %d: %d cards extracted (path=%s)",
+            category.slug, page_number, len(cards),
+            path_only(current_url, keep_query=True) or "/",
+        )
+        cards_seen += len(cards)
+        if collect_records:
+            output.extend(cards)
+
         if not cards:
             end_reason = "no_cards"
             break
-        output.extend(cards)
         if not next_url:
             end_reason = "no_next_page_link"
             break
@@ -407,7 +432,7 @@ def crawl_category(
     return output, {
         "tag": category.slug,
         "pages_visited": page_count,
-        "cards_seen": len(output),
+        "cards_seen": cards_seen,
         "end_reason": end_reason,
         "errors": errors,
     }
@@ -439,6 +464,54 @@ def select_categories(
     return remaining if all_tags else remaining[:max_tags]
 
 
+def crawl_categories_parallel(
+    categories: list[Category],
+    *,
+    workers: int,
+    max_pages: int,
+    delay_seconds: float,
+    base_url: str,
+    user_agent: str,
+    tag_ids: dict[str, int] | None = None,
+    sink: DatabaseSink | None = None,
+    run_id: int | None = None,
+    collect_records: bool = False,
+    fetcher: Callable[[requests.Session, str], str] = fetch_html,
+    session_factory: Callable[[str], Any] = build_session,
+) -> Iterator[tuple[Category, list[VideoCard], dict[str, Any]]]:
+    """Scrape categories concurrently, yielding each category as it completes.
+
+    Every worker owns its own HTTP session. PostgreSQL writes use the sink's
+    transaction lock, serializing page transactions while HTTP fetches overlap.
+    """
+    if workers < 1 or workers > 8:
+        raise ValueError("workers must be between 1 and 8")
+
+    def run_one(category: Category) -> tuple[Category, list[VideoCard], dict[str, Any]]:
+        session = session_factory(user_agent)
+        try:
+            records, stats = crawl_category(
+                category,
+                session=session,
+                max_pages=max_pages,
+                delay_seconds=delay_seconds,
+                base_url=base_url,
+                fetcher=fetcher,
+                sink=sink,
+                run_id=run_id,
+                tag_id=(tag_ids or {}).get(category.slug),
+                collect_records=collect_records,
+            )
+            return category, records, stats
+        finally:
+            session.close()
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="catalog") as executor:
+        future_map = {executor.submit(run_one, category): category for category in categories}
+        for future in as_completed(future_map):
+            yield future.result()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Extract listing-card metadata only; video and preview files are not downloaded."
@@ -447,18 +520,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tags", type=int, default=1, help="Limit the run to this many tags (safe default: 1).")
     parser.add_argument("--tag-offset", type=int, default=0, help="Zero-based category index to start at, for batch runs.")
     parser.add_argument("--all-tags", action="store_true", help="Process every tag from --tag-offset onward.")
-    parser.add_argument("--max-pages", type=int, default=40, help="Maximum pages per tag (default: 40).")
-    parser.add_argument("--delay", type=float, default=1.5, help="Seconds between page requests (default: 1.5).")
-    parser.add_argument("--output-jsonl", type=Path, help="Optional JSONL export path.")
+    parser.add_argument("--max-pages", type=int, default=140, help="Maximum pages per tag (default: 140).")
+    parser.add_argument("--workers", type=int, default=4, help="Concurrent tag workers (default: 4, maximum: 8).")
+    parser.add_argument("--delay", type=float, default=1.0, help="Seconds between page requests per tag (default: 1.0).")
+    parser.add_argument("--output-jsonl", type=Path, help="Optional JSONL export path; not used by GitHub Actions.")
     parser.add_argument("--write-db", action="store_true", help="Persist to PostgreSQL using DATABASE_URL.")
+    parser.add_argument(
+        "--continue-on-errors", action="store_true",
+        help="Return success after recording page errors, allowing the next workflow batch to continue.",
+    )
     parser.add_argument("--base-url", default=BASE_URL, help=argparse.SUPPRESS)
     parser.add_argument("--user-agent", default="forx_vid-catalog-scraper/1.0")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s: %(message)s")
     if args.max_pages < 1 or args.delay < 0 or args.max_tags < 1 or args.tag_offset < 0:
         parser.error("--max-pages and --max-tags must be >= 1; --tag-offset and --delay must be >= 0")
+    if not 1 <= args.workers <= 8:
+        parser.error("--workers must be between 1 and 8")
     if args.write_db and not os.environ.get("DATABASE_URL"):
         parser.error("--write-db requires DATABASE_URL in the environment")
 
@@ -470,50 +550,69 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not selected:
         parser.error(f"No categories available at zero-based --tag-offset {args.tag_offset}")
-    if not args.all_tags:
-        LOG.info(
-            "Limited mode: %d tag(s) starting at index %d, up to %d page(s) each.",
-            len(selected), args.tag_offset, args.max_pages,
-        )
-    else:
-        LOG.warning(
-            "Full catalog mode: %d tags from index %d × up to %d pages each.",
-            len(selected), args.tag_offset, args.max_pages,
-        )
+    LOG.info(
+        "Batch contains %d tag(s), starting index %d; max pages/tag=%d; workers=%d; delay=%.2fs.",
+        len(selected), args.tag_offset, args.max_pages, args.workers, args.delay,
+    )
 
-    session = build_session(args.user_agent)
     sink: DatabaseSink | None = None
     run_id: int | None = None
     all_records: list[VideoCard] = []
     category_stats: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    total_cards = 0
+    total_pages = 0
+    completed_tags = 0
+    video_paths: set[str] | None = set() if args.output_jsonl else None
+
     try:
         if args.write_db:
             sink = DatabaseSink(os.environ["DATABASE_URL"])
             run_id = sink.start_run(
                 {
-                    "max_pages": args.max_pages, "delay_seconds": args.delay,
-                    "all_tags": args.all_tags, "max_tags": args.max_tags,
-                    "tag_offset": args.tag_offset, "tags_file": str(args.tags_file),
+                    "max_pages": args.max_pages,
+                    "delay_seconds": args.delay,
+                    "workers": args.workers,
+                    "all_tags": args.all_tags,
+                    "max_tags": args.max_tags,
+                    "tag_offset": args.tag_offset,
+                    "tags_file": str(args.tags_file),
                 },
                 len(selected),
             )
 
-        for index, category in enumerate(selected, 1):
-            LOG.info("[%d/%d] Tag %s (%s)", index, len(selected), category.label, category.path)
-            tag_id = sink.upsert_category(category) if sink else None
-            records, stats = crawl_category(
-                category, session=session, max_pages=args.max_pages,
-                delay_seconds=args.delay, base_url=args.base_url,
-                sink=sink, run_id=run_id, tag_id=tag_id,
-            )
-            all_records.extend(records)
+        tag_ids: dict[str, int] = {}
+        if sink:
+            for category in selected:
+                tag_ids[category.slug] = sink.upsert_category(category)
+
+        for category, records, stats in crawl_categories_parallel(
+            selected,
+            workers=args.workers,
+            max_pages=args.max_pages,
+            delay_seconds=args.delay,
+            base_url=args.base_url,
+            user_agent=args.user_agent,
+            tag_ids=tag_ids,
+            sink=sink,
+            run_id=run_id,
+            collect_records=bool(args.output_jsonl),
+        ):
+            completed_tags += 1
+            total_cards += int(stats["cards_seen"])
+            total_pages += int(stats["pages_visited"])
             category_stats.append(stats)
             errors.extend({"tag": category.slug, "message": msg} for msg in stats["errors"])
+            if args.output_jsonl:
+                all_records.extend(records)
+                if video_paths is not None:
+                    video_paths.update(card.page_path for card in records)
             LOG.info(
-                "  %d page(s), %d card(s), stopped: %s",
+                "TAG COMPLETE [%d/%d] %s: %d page(s), %d cards, stop_reason=%s",
+                completed_tags, len(selected), category.slug,
                 stats["pages_visited"], stats["cards_seen"], stats["end_reason"],
             )
+            del records
 
         if args.output_jsonl:
             count = dump_jsonl(args.output_jsonl, all_records)
@@ -522,20 +621,24 @@ def main(argv: list[str] | None = None) -> int:
         summary = {
             "tags_requested": len(selected),
             "tags_processed": len(category_stats),
-            "pages_visited": sum(s["pages_visited"] for s in category_stats),
-            "cards_seen": sum(s["cards_seen"] for s in category_stats),
-            "unique_video_paths": len({record.page_path for record in all_records}),
+            "pages_visited": total_pages,
+            "cards_seen": total_cards,
+            "unique_video_paths": len(video_paths) if video_paths is not None else None,
+            "workers": args.workers,
             "errors": errors,
             "categories": category_stats,
         }
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         if sink and run_id is not None:
             sink.finish_run(run_id, "completed" if not errors else "partial", summary)
-        return 1 if errors else 0
+        if errors:
+            LOG.warning("%d page/category error(s) were recorded; see per-page logs.", len(errors))
+        return 0 if not errors or args.continue_on_errors else 1
     finally:
-        session.close()
         if sink:
             sink.close()
+
+
 
 
 if __name__ == "__main__":
