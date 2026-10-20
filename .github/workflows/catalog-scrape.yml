@@ -19,7 +19,7 @@ on:
         type: number
         default: 40
       write_db:
-        description: "Also write results to Neon (requires DATABASE_URL secret and applied schema)"
+        description: "Also write results to Neon (requires DATABASE_URL secret; workflow applies schema first)"
         required: true
         type: boolean
         default: false
