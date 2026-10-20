@@ -4,43 +4,64 @@ on:
   workflow_dispatch:
     inputs:
       tag_offset:
-        description: "Zero-based index of the first category in tag_list.json (try 0, 10, 20...)"
+        description: "Zero-based index of first category (the workflow continues in batches)"
         required: true
         type: number
         default: 0
       max_tags:
-        description: "How many categories to process in this batch (maximum 20)"
+        description: "Categories per workflow run (maximum 20)"
+        required: true
+        type: number
+        default: 20
+      max_pages:
+        description: "Maximum listing pages per category (up to 140)"
+        required: true
+        type: number
+        default: 140
+      workers:
+        description: "Concurrent category workers (maximum 8)"
+        required: true
+        type: number
+        default: 4
+      delay_seconds:
+        description: "Delay between requests within each category (minimum 1 second)"
         required: true
         type: number
         default: 1
-      max_pages:
-        description: "Maximum listing pages per category (maximum 40)"
-        required: true
-        type: number
-        default: 40
       write_db:
-        description: "Also write results to Neon (requires DATABASE_URL secret; workflow applies schema first)"
+        description: "Write rows to Neon; schema is applied first"
         required: true
         type: boolean
         default: false
+      auto_continue:
+        description: "Automatically queue the next category batch until all tags are processed"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
+  actions: write
 
+# Only one catalog run may write to this database at a time. The next batch is
+# dispatched by the current run and waits on this concurrency group to finish.
 concurrency:
   group: catalog-scrape
   cancel-in-progress: false
 
 jobs:
   scrape:
-    name: Test and scrape metadata
+    name: Test and scrape a category batch
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
       TAG_OFFSET: ${{ inputs.tag_offset }}
       MAX_TAGS: ${{ inputs.max_tags }}
       MAX_PAGES: ${{ inputs.max_pages }}
+      WORKERS: ${{ inputs.workers }}
+      DELAY_SECONDS: ${{ inputs.delay_seconds }}
       WRITE_DB: ${{ inputs.write_db }}
+      AUTO_CONTINUE: ${{ inputs.auto_continue }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
     steps:
@@ -55,31 +76,15 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
       - name: Run offline tests first
         run: python -m pytest -q
 
-      - name: Validate batch limits
+      - name: Validate inputs
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$TAG_OFFSET" -lt 0 ]]; then
-            echo "tag_offset must be zero or greater."
-            exit 2
-          fi
-          if [[ "$MAX_TAGS" -lt 1 || "$MAX_TAGS" -gt 20 ]]; then
-            echo "max_tags must be between 1 and 20 per run."
-            exit 2
-          fi
-          if [[ "$MAX_PAGES" -lt 1 || "$MAX_PAGES" -gt 40 ]]; then
-            echo "max_pages must be between 1 and 40 per category."
-            exit 2
-          fi
-          if [[ "$WRITE_DB" == "true" && -z "$DATABASE_URL" ]]; then
-            echo "write_db was enabled, but the repository secret DATABASE_URL is not configured."
-            exit 2
-          fi
           python - <<'PY'
           import json
           import os
@@ -87,36 +92,94 @@ jobs:
               tags = json.load(f)
           offset = int(os.environ["TAG_OFFSET"])
           max_tags = int(os.environ["MAX_TAGS"])
-          print(f"Repository tag list: {len(tags)} entries.")
-          print(f"Requested zero-based range: {offset} through {offset + max_tags - 1}.")
+          max_pages = int(os.environ["MAX_PAGES"])
+          workers = int(os.environ["WORKERS"])
+          delay = float(os.environ["DELAY_SECONDS"])
+          if offset < 0:
+              raise SystemExit("tag_offset must be >= 0")
+          if not 1 <= max_tags <= 20:
+              raise SystemExit("max_tags must be between 1 and 20")
+          if not 1 <= max_pages <= 140:
+              raise SystemExit("max_pages must be between 1 and 140")
+          if not 1 <= workers <= 8:
+              raise SystemExit("workers must be between 1 and 8")
+          if delay < 1:
+              raise SystemExit("delay_seconds must be at least 1 to avoid excessive request rates")
+          if offset >= len(tags):
+              raise SystemExit(f"tag_offset {offset} is outside the tag list (count={len(tags)})")
+          if os.environ["WRITE_DB"].lower() == "true" and not os.environ.get("DATABASE_URL"):
+              raise SystemExit("write_db is enabled but the DATABASE_URL repository secret is missing")
+          print(f"Tag list: {len(tags)}")
+          print(f"Batch indexes: {offset} through {min(offset + max_tags - 1, len(tags) - 1)}")
+          print(f"Workers: {workers}; delay/category: {delay}s; max pages/category: {max_pages}")
           PY
 
-      - name: Apply catalog schema (only when Neon writes are enabled)
+      - name: Apply catalog schema before database writes
         if: env.WRITE_DB == 'true'
         run: python -m scraper.apply_schema
 
-      - name: Scrape selected category batch
+      - name: Scrape categories (page counts are written to the job log)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts
           args=(
             --tag-offset "$TAG_OFFSET"
             --max-tags "$MAX_TAGS"
             --max-pages "$MAX_PAGES"
-            --delay 2
-            --output-jsonl artifacts/catalog.jsonl
+            --workers "$WORKERS"
+            --delay "$DELAY_SECONDS"
+            --continue-on-errors
           )
           if [[ "$WRITE_DB" == "true" ]]; then
             args+=(--write-db)
           fi
-          python -m scraper.catalog_scraper "${args[@]}" | tee artifacts/summary.json
+          python -m scraper.catalog_scraper "${args[@]}"
 
-      - name: Upload scraped metadata
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: catalog-metadata
-          path: artifacts/
-          if-no-files-found: warn
-          retention-days: 14
+      - name: Queue the next batch automatically
+        if: ${{ success() && inputs.auto_continue }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOTAL_TAGS="$(python -c 'import json; print(len(json.load(open("tag_list.json", encoding="utf-8"))))')"
+          NEXT_OFFSET=$((TAG_OFFSET + MAX_TAGS))
+          if (( NEXT_OFFSET >= TOTAL_TAGS )); then
+            echo "All ${TOTAL_TAGS} categories have been processed. No next batch is needed."
+            {
+              echo "## Catalog crawl"
+              echo "All ${TOTAL_TAGS} tags reached; queue is complete."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          export NEXT_OFFSET
+          python - <<'PY' > dispatch.json
+          import json
+          import os
+          payload = {
+              "ref": "main",
+              "inputs": {
+                  "tag_offset": os.environ["NEXT_OFFSET"],
+                  "max_tags": os.environ["MAX_TAGS"],
+                  "max_pages": os.environ["MAX_PAGES"],
+                  "workers": os.environ["WORKERS"],
+                  "delay_seconds": os.environ["DELAY_SECONDS"],
+                  "write_db": os.environ["WRITE_DB"].lower(),
+                  "auto_continue": "true",
+              },
+          }
+          print(json.dumps(payload))
+          PY
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --url "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/catalog-scrape.yml/dispatches" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --data-binary @dispatch.json
+          echo "Queued next batch beginning at tag index ${NEXT_OFFSET}."
+          {
+            echo "## Catalog crawl"
+            echo "Queued next batch beginning at tag index ${NEXT_OFFSET}."
+          } >> "$GITHUB_STEP_SUMMARY"
