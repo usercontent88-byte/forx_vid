@@ -58,7 +58,7 @@ jobs:
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
       - name: Run offline tests first
-        run: pytest -q
+        run: python -m pytest -q
 
       - name: Validate batch limits
         shell: bash
