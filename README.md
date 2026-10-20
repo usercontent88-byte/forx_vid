@@ -1,95 +1,73 @@
 # forx_vid catalog scraper
 
-A test-first scraper for listing-card metadata. It does not download video or preview files. Stored URLs are paths rather than full URLs, for example \`/video.example/title\` or \`/folder/xv_16_t.jpg\`.
+This repository contains a testable metadata scraper and a chained GitHub Actions workflow. It reads video listing cards only; it does not download video or preview media.
+
+Stored URLs are paths rather than full URLs, for example `/video.example/title` or `/folder/xv_16_t.jpg`.
 
 ## Extracted fields
 
-- Video page path and title
-- Displayed duration and normalized duration in seconds
-- Thumbnail and mosaic image paths
-- An optional preview path derived from the thumbnail directory (never fetched)
-- Source card IDs and category/tag associations
+- Video page path, title, and source card identifiers
+- Display duration and normalized duration in seconds
+- Thumbnail and mosaic paths
+- A derived preview path (never fetched)
+- Tag/category relationships
 
-The database schema reserves nullable fields for future descriptions, likes and views, and stores selected source fields in JSONB so later detail-page parsing can be extended.
+## Workflow: start once, continue automatically
+
+Open **Actions → Catalog scrape → Run workflow** and start the first batch. With `auto_continue=true`, the workflow queues the next batch automatically until every tag index has been processed. It does not create output artifacts; per-page logs and batch summaries are available in the Actions run logs.
+
+The repository's current tag list contains 2,000 tags. Recommended starting defaults:
+
+| Setting | Default | Allowed |
+|---|---:|---:|
+| Starting tag index | 0 | 0 or greater |
+| Tags per workflow run | 20 | 1–20 |
+| Pages per tag | 140 | 1–140 |
+| Concurrent tag workers | 4 | 1–8 |
+| Delay between requests per tag | 1 second | At least 1 second |
+| Write to Neon | Off | On, when configured |
+| Auto-continue batches | On | On/Off |
+
+Four workers fetch separate categories concurrently. Every worker has its own HTTP session. Database writes use a shared transaction lock and `ON CONFLICT` upserts, so the database connection is never used by two page-write transactions at once. The crawler reports each page, including the tag, page number, cards extracted, and path, in the Actions log.
+
+The workflow uses GitHub's built-in token to dispatch the next `workflow_dispatch` run. The next run waits on the `catalog-scrape` concurrency group so runs do not overlap. Automatic continuation occurs only if the current workflow completes successfully. Ordinary page-level request errors are logged and stored as partial results so the next batch can continue; database/configuration errors fail the run and stop the chain.
 
 ## Setup
 
 Python 3.10+ is recommended.
 
-\`\`\`bash
+```bash
 python -m venv .venv
-# Windows PowerShell: .venv\Scripts\Activate.ps1
+# Windows PowerShell: .venv\\Scripts\\Activate.ps1
 # macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
-\`\`\`
+python -m pip install -r requirements.txt
+```
 
-\`tag_list.json\` should be present in the repository root. Never commit a real \`DATABASE_URL\`; keep it in an environment variable or a local ignored file.
+Run offline tests:
 
-## 1. Run offline tests
-
-\`\`\`bash
+```bash
 python -m pytest -q
-\`\`\`
+```
 
-The tests use a local HTML fixture and do not make network requests or write to Neon.
+## Neon database writes
 
-## 2. Run a tiny live smoke test
+To write to Neon, enable `write_db` when starting a workflow and add a repository Actions secret named `DATABASE_URL` for the intended database. The workflow applies `migrations/001_video_catalog.sql` before scraping. Its `CREATE TABLE/INDEX IF NOT EXISTS` statements are idempotent and do not drop or truncate data.
 
-Start with just one category and one page, exporting JSONL without database writes:
+The five tables are `catalog_tags`, `catalog_videos`, `catalog_video_tags`, `catalog_scrape_runs`, and `catalog_scrape_pages`. They keep tags normalized, de-duplicate videos by source + page path, preserve tag associations, and record per-page counts/errors for future diagnosis.
 
-\`\`\`bash
-python -m scraper.catalog_scraper --max-tags 1 --max-pages 1 --delay 2 --output-jsonl tmp/one-tag.jsonl
-\`\`\`
+## Local command line
 
-Inspect the summary and sample rows before expanding. Only collect and reuse metadata where you have permission, and check the source site's terms and crawling rules first.
+Small local run, with no database writes:
 
-## 3. Use Neon
+```bash
+python -m scraper.catalog_scraper --max-tags 1 --max-pages 1 --delay 2
+```
 
-Apply \`migrations/001_video_catalog.sql\` to the intended database/branch. Then set \`DATABASE_URL\` in your environment and run one controlled DB test.
+Local scrape with Neon enabled (after setting `DATABASE_URL`):
 
-PowerShell:
+```bash
+python -m scraper.apply_schema
+python -m scraper.catalog_scraper --max-tags 1 --max-pages 140 --workers 4 --delay 1 --write-db
+```
 
-\`\`\`powershell
-$env:DATABASE_URL = "<your Neon connection string>"
-python -m scraper.catalog_scraper --max-tags 1 --max-pages 1 --delay 2 --write-db
-\`\`\`
-
-bash/zsh:
-
-\`\`\`bash
-export DATABASE_URL="<your Neon connection string>"
-python -m scraper.catalog_scraper --max-tags 1 --max-pages 1 --delay 2 --write-db
-\`\`\`
-
-Database writes are opt-in. Without \`--write-db\`, the script does not connect to or modify Neon.
-
-## 4. Expand carefully
-
-- More tags: \`--max-tags 10\`
-- Up to 40 pages per selected tag: \`--max-tags 10 --max-pages 40\`
-- Full tag list: \`--all-tags --max-pages 40\`
-
-The current \`tag_list.json\` contains 2,000 tags, so a full run could request up to 80,000 pages. Start with small runs, keep a delay, watch failures, and stop if the source blocks or disallows collection. The crawler follows the page's real next link, stops at no cards/no next link, and detects pagination loops.
-
-## Schema overview
-
-- \`catalog_tags\`: normalized categories
-- \`catalog_videos\`: one row per source + video path
-- \`catalog_video_tags\`: many-to-many video/tag relationships
-- \`catalog_scrape_runs\`: run settings, totals and errors
-- \`catalog_scrape_pages\`: per-page outcomes for diagnosis and retry planning
-
-The initial migration uses \`CREATE TABLE/INDEX IF NOT EXISTS\` so it can be applied repeatedly.
-
-
-## 5. Run the GitHub Actions workflow
-
-The repository includes **Actions → Catalog scrape → Run workflow** for a manual run. It runs the offline tests first, then scrapes the selected category batch and uploads a JSONL artifact.
-
-Inputs:
-- `tag_offset`: zero-based start index for batching the 2,000 tags (for example 0, 10, 20).
-- `max_tags`: number of tags in this batch; workflow limits one run to 20 tags.
-- `max_pages`: up to 40 listing pages per tag.
-- `write_db`: off by default; turn it on only after adding a repository Actions secret named `DATABASE_URL` and applying the schema migration to the intended Neon branch.
-
-Each run waits at least two seconds between page requests. A single run is deliberately batch-limited so the entire list is not hit in one enormous job. To process successive batches, rerun with offsets such as 0, 10, 20, 30, etc. The workflow outputs `catalog-metadata` as a downloadable JSONL artifact even when database writes are disabled.
+JSONL export remains optional for local use through `--output-jsonl`; GitHub Actions does not generate or upload artifacts.
