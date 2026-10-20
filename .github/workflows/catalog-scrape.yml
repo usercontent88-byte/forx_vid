@@ -1,0 +1,115 @@
+name: Catalog scrape
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_offset:
+        description: "Zero-based index of the first category in tag_list.json (try 0, 10, 20...)"
+        required: true
+        type: number
+        default: 0
+      max_tags:
+        description: "How many categories to process in this batch (maximum 20)"
+        required: true
+        type: number
+        default: 1
+      max_pages:
+        description: "Maximum listing pages per category (maximum 40)"
+        required: true
+        type: number
+        default: 40
+      write_db:
+        description: "Also write results to Neon (requires DATABASE_URL secret and applied schema)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalog-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    name: Test and scrape metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TAG_OFFSET: ${{ inputs.tag_offset }}
+      MAX_TAGS: ${{ inputs.max_tags }}
+      MAX_PAGES: ${{ inputs.max_pages }}
+      WRITE_DB: ${{ inputs.write_db }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Run offline tests first
+        run: pytest -q
+
+      - name: Validate batch limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$TAG_OFFSET" -lt 0 ]]; then
+            echo "tag_offset must be zero or greater."
+            exit 2
+          fi
+          if [[ "$MAX_TAGS" -lt 1 || "$MAX_TAGS" -gt 20 ]]; then
+            echo "max_tags must be between 1 and 20 per run."
+            exit 2
+          fi
+          if [[ "$MAX_PAGES" -lt 1 || "$MAX_PAGES" -gt 40 ]]; then
+            echo "max_pages must be between 1 and 40 per category."
+            exit 2
+          fi
+          if [[ "$WRITE_DB" == "true" && -z "$DATABASE_URL" ]]; then
+            echo "write_db was enabled, but the repository secret DATABASE_URL is not configured."
+            exit 2
+          fi
+          python - <<'PY'
+          import json
+          with open("tag_list.json", encoding="utf-8") as f:
+              tags = json.load(f)
+          print(f"Repository tag list: {len(tags)} entries.")
+          print(f"Requested zero-based range: {TAG_OFFSET} through {int(TAG_OFFSET) + int(MAX_TAGS) - 1}.")
+          PY
+
+      - name: Scrape selected category batch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          args=(
+            --tag-offset "$TAG_OFFSET"
+            --max-tags "$MAX_TAGS"
+            --max-pages "$MAX_PAGES"
+            --delay 2
+            --output-jsonl artifacts/catalog.jsonl
+          )
+          if [[ "$WRITE_DB" == "true" ]]; then
+            args+=(--write-db)
+          fi
+          python -m scraper.catalog_scraper "${args[@]}" | tee artifacts/summary.json
+
+      - name: Upload scraped metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: catalog-metadata
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
