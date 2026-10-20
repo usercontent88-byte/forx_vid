@@ -80,3 +80,16 @@ The current \`tag_list.json\` contains 2,000 tags, so a full run could request u
 - \`catalog_scrape_pages\`: per-page outcomes for diagnosis and retry planning
 
 The initial migration uses \`CREATE TABLE/INDEX IF NOT EXISTS\` so it can be applied repeatedly.
+
+
+## 5. Run the GitHub Actions workflow
+
+The repository includes **Actions → Catalog scrape → Run workflow** for a manual run. It runs the offline tests first, then scrapes the selected category batch and uploads a JSONL artifact.
+
+Inputs:
+- `tag_offset`: zero-based start index for batching the 2,000 tags (for example 0, 10, 20).
+- `max_tags`: number of tags in this batch; workflow limits one run to 20 tags.
+- `max_pages`: up to 40 listing pages per tag.
+- `write_db`: off by default; turn it on only after adding a repository Actions secret named `DATABASE_URL` and applying the schema migration to the intended Neon branch.
+
+Each run waits at least two seconds between page requests. A single run is deliberately batch-limited so the entire list is not hit in one enormous job. To process successive batches, rerun with offsets such as 0, 10, 20, 30, etc. The workflow outputs `catalog-metadata` as a downloadable JSONL artifact even when database writes are disabled.
