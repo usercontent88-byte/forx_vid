@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup, Tag as Bs4Tag
@@ -198,8 +198,12 @@ def load_categories(file_path: Path) -> list[Category]:
             continue
         label = str(item.get("tag") or "").strip()
         href = str(item.get("href") or "").strip()
-        path = path_only(href)
-        slug = urlsplit(path or "").path.rstrip("/").split("/")[-1] if path else ""
+        path = path_only(href, keep_query=True)
+        parsed_path = urlsplit(path or "").path
+        segments = [segment for segment in parsed_path.rstrip("/").split("/") if segment]
+        slug = segments[-1] if segments and segments[-2:-1] == ["tags"] else ""
+        if not slug:
+            slug = parse_qs(urlsplit(path or "").query).get("k", [""])[0].strip()
         if not label or not slug or slug in seen:
             continue
         result.append(Category(slug=slug, label=label, path=path or f"/tags/{slug}"))
