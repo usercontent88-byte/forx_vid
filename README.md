@@ -28,7 +28,7 @@ pip install -r requirements.txt
 ## 1. Run offline tests
 
 \`\`\`bash
-pytest -q
+python -m pytest -q
 \`\`\`
 
 The tests use a local HTML fixture and do not make network requests or write to Neon.
