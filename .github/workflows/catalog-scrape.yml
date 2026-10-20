@@ -82,10 +82,13 @@ jobs:
           fi
           python - <<'PY'
           import json
+          import os
           with open("tag_list.json", encoding="utf-8") as f:
               tags = json.load(f)
+          offset = int(os.environ["TAG_OFFSET"])
+          max_tags = int(os.environ["MAX_TAGS"])
           print(f"Repository tag list: {len(tags)} entries.")
-          print(f"Requested zero-based range: {TAG_OFFSET} through {int(TAG_OFFSET) + int(MAX_TAGS) - 1}.")
+          print(f"Requested zero-based range: {offset} through {offset + max_tags - 1}.")
           PY
 
       - name: Scrape selected category batch
