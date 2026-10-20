@@ -132,3 +132,17 @@ def test_select_categories_supports_batches_and_final_partial_batch():
     assert [x.slug for x in select_categories(tags, max_tags=2, tag_offset=2)] == ["tag-2", "tag-3"]
     assert [x.slug for x in select_categories(tags, max_tags=2, tag_offset=4)] == ["tag-4"]
     assert [x.slug for x in select_categories(tags, tag_offset=3, all_tags=True)] == ["tag-3", "tag-4"]
+
+
+
+def test_schema_migration_is_idempotent_and_includes_required_tables():
+    from scraper.apply_schema import load_migration_sql
+
+    sql = load_migration_sql().lower()
+    assert "create table if not exists catalog_tags" in sql
+    assert "create table if not exists catalog_videos" in sql
+    assert "create table if not exists catalog_video_tags" in sql
+    assert "create table if not exists catalog_scrape_runs" in sql
+    assert "create table if not exists catalog_scrape_pages" in sql
+    assert "drop table" not in sql
+    assert "truncate table" not in sql
