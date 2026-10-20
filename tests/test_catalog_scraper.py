@@ -9,6 +9,7 @@ from scraper.catalog_scraper import (
     parse_duration,
     parse_listing_html,
     path_only,
+    select_categories,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -119,3 +120,15 @@ def test_loads_query_style_category_paths_without_losing_filter():
     assert len(tags) == 1
     assert tags[0].slug == "18yearsold"
     assert tags[0].path == "/?k=18yearsold&p="
+
+
+
+def test_select_categories_supports_batches_and_final_partial_batch():
+    tags = [
+        Category(slug=f"tag-{i}", label=f"Tag {i}", path=f"/tags/tag-{i}")
+        for i in range(5)
+    ]
+    assert [x.slug for x in select_categories(tags, max_tags=2, tag_offset=0)] == ["tag-0", "tag-1"]
+    assert [x.slug for x in select_categories(tags, max_tags=2, tag_offset=2)] == ["tag-2", "tag-3"]
+    assert [x.slug for x in select_categories(tags, max_tags=2, tag_offset=4)] == ["tag-4"]
+    assert [x.slug for x in select_categories(tags, tag_offset=3, all_tags=True)] == ["tag-3", "tag-4"]
